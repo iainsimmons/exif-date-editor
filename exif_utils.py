@@ -1,151 +1,239 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
+import json
 import os
-import subprocess
 import re
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from file_model import normalize_path, parse_exif_datetime
+
+DATE_TAGS = ("DateTimeOriginal", "CreateDate", "ModifyDate", "FileModifyDate")
+METADATA_TAGS = ("OwnerName", "Artist", "Copyright", "ImageDescription")
+ALL_TAGS = (*DATE_TAGS, *METADATA_TAGS)
+
+
 def find_exiftool():
-    """Find exiftool binary"""
     script_dir = Path(__file__).parent
     candidates = [
         script_dir / "exiftool-bin" / "exiftool",
         script_dir / "exiftool",
     ]
-    for c in candidates:
-        p = Path(c)
-        if p.exists() and os.access(p, os.X_OK):
-            return str(p.resolve())
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.exists() and os.access(path, os.X_OK):
+            return str(path.resolve())
     return "exiftool"
+
 
 EXIFTOOL = find_exiftool()
 
-def read_alldates(file_paths):
-    """Read AllDates for files. Returns dict of path -> date string."""
-    if not file_paths:
-        return {}
-    result = {}
-    try:
-        cmd = [EXIFTOOL, "-s", "-s", "-s", "-AllDates"] + [str(p) for p in file_paths]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output = proc.stdout.decode('utf-8', errors='replace')
-        current_file = None
-        for line in output.splitlines():
-            line_stripped = line.strip()
-            if not line_stripped:
-                continue
-            if line_stripped.startswith('========'):
-                current_file = line_stripped.replace('========', '').strip()
-                continue
-            if line_stripped.lower().startswith('alldates') and current_file:
-                parts = line_stripped.split(':', 1)
-                if len(parts) == 2:
-                    result[current_file] = parts[1].strip()
-                    # Also store by basename
-                    result[os.path.basename(current_file)] = parts[1].strip()
-            elif current_file and ':' in line_stripped and not line_stripped.lower().startswith('alldates'):
-                # Sometimes just the value
-                if re.match(r'^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$', line_stripped):
-                    result[current_file] = line_stripped
-                    result[os.path.basename(current_file)] = line_stripped
-            elif not current_file and re.match(r'^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$', line_stripped):
-                # Single file case
-                if file_paths:
-                    result[str(file_paths[0])] = line_stripped
-                    result[os.path.basename(str(file_paths[0]))] = line_stripped
-    except Exception as e:
-        print(f"Error reading dates: {e}")
+
+def _unique_paths(file_paths) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for path in file_paths:
+        normalized = normalize_path(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
     return result
 
-def set_alldates(file_paths, date_str):
-    """Set AllDates for files. date_str should be YYYY:MM:DD HH:MM:SS"""
-    if not file_paths or not date_str:
-        return False, "No files or date"
-    if not re.match(r'^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$', date_str):
-        return False, "Invalid date format. Use YYYY:MM:DD HH:MM:SS"
-    try:
-        cmd = [EXIFTOOL, f'-AllDates={date_str}', '-overwrite_original'] + [str(p) for p in file_paths]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out = proc.stdout.decode('utf-8', errors='replace')
-        err = proc.stderr.decode('utf-8', errors='replace')
-        if proc.returncode != 0:
-            return False, err or out
-        return True, out
-    except Exception as e:
-        return False, str(e)
 
-def parse_offset(offset_str):
-    """Parse offset like -1d, +10h, -30m, +2d3h"""
-    offset_str = offset_str.strip().lower()
+def read_metadata(file_paths) -> dict[str, dict[str, str]]:
+    paths = _unique_paths(file_paths)
+    if not paths:
+        return {}
+    cmd = [EXIFTOOL, "-j", *[f"-{tag}" for tag in ALL_TAGS], *paths]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if not proc.stdout:
+        return {}
+    try:
+        records = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+    except ValueError:
+        return {}
+    if not isinstance(records, list):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        source = record.get("SourceFile")
+        if not source:
+            continue
+        key = normalize_path(source)
+        values: dict[str, str] = {}
+        for tag in ALL_TAGS:
+            value = record.get(tag)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                values[tag] = text
+        result[key] = values
+    return result
+
+
+def read_alldates(file_paths) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for path, metadata in read_metadata(file_paths).items():
+        for tag in DATE_TAGS:
+            value = metadata.get(tag)
+            if value:
+                result[path] = value
+                break
+    return result
+
+
+def _run_write(arguments: list[str], file_paths) -> tuple[bool, str]:
+    paths = _unique_paths(file_paths)
+    if not paths:
+        return False, "No files"
+    cmd = [EXIFTOOL, "-overwrite_original", *arguments, *paths]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    err = proc.stderr.decode("utf-8", errors="replace").strip()
+    message = out or err
+    if proc.returncode != 0:
+        return False, message or "exiftool failed"
+    return True, message or f"Updated {len(paths)} file(s)"
+
+
+def set_alldates(file_paths, date_str: str) -> tuple[bool, str]:
+    if not date_str:
+        return False, "No date"
+    if not re.match(r"^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$", date_str):
+        return False, "Invalid date format. Use YYYY:MM:DD HH:MM:SS"
+    return _run_write([f"-AllDates={date_str}"], file_paths)
+
+
+def parse_offset(offset_str: str) -> timedelta:
+    text = offset_str.strip().lower()
+    if not text:
+        raise ValueError("Empty offset")
+    matches = list(re.finditer(r"([+-]?)(\d+)([dhms])", text))
+    if not matches:
+        raise ValueError("Invalid offset. Use e.g. -1d, +10h, -30m, +2d3h")
+    remainder = re.sub(r"[+-]?\d+[dhms]", "", text).strip()
+    if remainder:
+        raise ValueError(f"Invalid offset near '{remainder}'")
     total_seconds = 0
-    for sign, num, unit in re.findall(r'([+-]?)(\d+)([dhms])', offset_str):
-        n = int(num)
-        if sign == '-':
-            n = -n
-        elif sign == '+' and offset_str and not offset_str.startswith(('+','-')) and total_seconds == 0:
-            pass
-        if unit == 'd':
-            total_seconds += n * 86400
-        elif unit == 'h':
-            total_seconds += n * 3600
-        elif unit == 'm':
-            total_seconds += n * 60
-        elif unit == 's':
-            total_seconds += n
+    sign = 1
+    multipliers = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    for match in matches:
+        prefix, number, unit = match.groups()
+        if prefix == "-":
+            sign = -1
+        elif prefix == "+":
+            sign = 1
+        total_seconds += sign * int(number) * multipliers[unit]
     return timedelta(seconds=total_seconds)
 
-def apply_offset(file_paths, offset_str):
-    """Apply offset to each file's AllDates"""
-    if not file_paths or not offset_str:
-        return False, "No files or offset"
-    td = parse_offset(offset_str)
-    dates = read_alldates(file_paths)
-    success = 0
-    errors = []
-    for f in file_paths:
-        fstr = str(f)
-        cur = dates.get(fstr) or dates.get(os.path.basename(fstr))
-        if not cur:
-            errors.append(f"{os.path.basename(fstr)}: no date found")
-            continue
-        try:
-            dt = datetime.strptime(cur, "%Y:%m:%d %H:%M:%S")
-            new_dt = dt + td
-            new_str = new_dt.strftime("%Y:%m:%d %H:%M:%S")
-            ok, msg = set_alldates([f], new_str)
-            if ok:
-                success += 1
-            else:
-                errors.append(f"{os.path.basename(fstr)}: {msg}")
-        except Exception as e:
-            errors.append(f"{os.path.basename(fstr)}: {e}")
-    return success > 0, f"Updated {success}/{len(file_paths)} files. " + "; ".join(errors)
 
-def set_date_keep_time(file_paths, new_date_str):
-    """Set date keeping original time. new_date_str should be YYYY-MM-DD or YYYY:MM:DD"""
-    if not file_paths or not new_date_str:
-        return False, "No files or date"
-    new_date_str = new_date_str.replace('-', ':')
-    if not re.match(r'^\d{4}:\d{2}:\d{2}$', new_date_str):
-        return False, "Invalid date format. Use YYYY-MM-DD"
-    dates = read_alldates(file_paths)
+def _first_date(metadata: dict[str, str] | None) -> str | None:
+    if not metadata:
+        return None
+    for tag in ("DateTimeOriginal", "CreateDate", "ModifyDate"):
+        value = metadata.get(tag)
+        if value:
+            return value
+    return None
+
+
+def apply_offset(file_paths, offset_str: str, metadata: dict[str, dict[str, str]] | None = None):
+    paths = _unique_paths(file_paths)
+    if not paths:
+        return False, "No files"
+    try:
+        delta = parse_offset(offset_str)
+    except ValueError as error:
+        return False, str(error)
+    if metadata is None:
+        metadata = read_metadata(paths)
     success = 0
-    errors = []
-    for f in file_paths:
-        fstr = str(f)
-        cur = dates.get(fstr) or dates.get(os.path.basename(fstr))
-        if not cur:
-            errors.append(f"{os.path.basename(fstr)}: no date found")
+    errors: list[str] = []
+    for path in paths:
+        current = _first_date(metadata.get(path))
+        if not current:
+            errors.append(f"{os.path.basename(path)}: no date found")
             continue
-        try:
-            parts = cur.split()
-            time_part = parts[1] if len(parts) == 2 else "00:00:00"
-            new_str = f"{new_date_str} {time_part}"
-            ok, msg = set_alldates([f], new_str)
-            if ok:
-                success += 1
-            else:
-                errors.append(f"{os.path.basename(fstr)}: {msg}")
-        except Exception as e:
-            errors.append(f"{os.path.basename(fstr)}: {e}")
-    return success > 0, f"Updated {success}/{len(file_paths)} files. " + "; ".join(errors)
+        parsed = parse_exif_datetime(current)
+        if parsed is None:
+            errors.append(f"{os.path.basename(path)}: invalid date '{current}'")
+            continue
+        new_value = (parsed + delta).strftime("%Y:%m:%d %H:%M:%S")
+        ok, message = set_alldates([path], new_value)
+        if ok:
+            success += 1
+        else:
+            errors.append(f"{os.path.basename(path)}: {message}")
+    summary = f"Updated {success}/{len(paths)} files."
+    if errors:
+        summary += " " + "; ".join(errors)
+    return success > 0, summary
+
+
+def set_date_keep_time(
+    file_paths,
+    new_date_str: str,
+    metadata: dict[str, dict[str, str]] | None = None,
+):
+    paths = _unique_paths(file_paths)
+    if not paths:
+        return False, "No files"
+    if not new_date_str:
+        return False, "No date"
+    normalized = new_date_str.strip().replace("-", ":")
+    try:
+        new_date = datetime.strptime(normalized, "%Y:%m:%d")
+    except ValueError:
+        return False, "Invalid date format. Use YYYY-MM-DD"
+    if metadata is None:
+        metadata = read_metadata(paths)
+    success = 0
+    errors: list[str] = []
+    for path in paths:
+        current = _first_date(metadata.get(path))
+        if not current:
+            errors.append(f"{os.path.basename(path)}: no date found")
+            continue
+        parsed = parse_exif_datetime(current)
+        if parsed is None:
+            errors.append(f"{os.path.basename(path)}: invalid date '{current}'")
+            continue
+        new_value = new_date.replace(hour=parsed.hour, minute=parsed.minute, second=parsed.second)
+        ok, message = set_alldates([path], new_value.strftime("%Y:%m:%d %H:%M:%S"))
+        if ok:
+            success += 1
+        else:
+            errors.append(f"{os.path.basename(path)}: {message}")
+    summary = f"Updated {success}/{len(paths)} files."
+    if errors:
+        summary += " " + "; ".join(errors)
+    return success > 0, summary
+
+
+def set_metadata(file_paths, fields: dict[str, str | None]) -> tuple[bool, str]:
+    paths = _unique_paths(file_paths)
+    if not paths:
+        return False, "No files"
+    if not fields:
+        return False, "No metadata fields"
+    arguments: list[str] = []
+    for tag, value in fields.items():
+        if tag not in METADATA_TAGS:
+            return False, f"Unsupported metadata field: {tag}"
+        if value is None:
+            arguments.append(f"-{tag}=")
+        else:
+            arguments.append(f"-{tag}={value}")
+    return _run_write(arguments, paths)

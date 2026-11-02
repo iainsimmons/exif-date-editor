@@ -1,51 +1,52 @@
 #!/usr/bin/env python3
-import os
+from __future__ import annotations
+
+import io
 import subprocess
-import tempfile
 from pathlib import Path
 
-def find_exiftool():
-    script_dir = Path(__file__).parent
-    candidates = [
-        script_dir / "exiftool-bin" / "exiftool",
-        script_dir / "exiftool",
-    ]
-    for c in candidates:
-        p = Path(c)
-        if p.exists() and os.access(p, os.X_OK):
-            return str(p.resolve())
-    return "exiftool"
+from PIL import Image, ImageOps
 
-EXIFTOOL = find_exiftool()
+from exif_utils import EXIFTOOL
 
-def get_preview_image(file_path):
-    """Get a displayable preview image path for JPG/ORF"""
-    file_path = str(file_path)
-    ext = Path(file_path).suffix.lower()
-    
-    if ext in ['.jpg', '.jpeg']:
-        return file_path
-    
-    if ext in ['.orf']:
-        # Try to extract preview
+PREVIEW_TAGS = ("PreviewImage", "JpgFromRaw", "ThumbnailImage")
+
+
+def _open_image(data: bytes) -> Image.Image | None:
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+        image = ImageOps.exif_transpose(image)
+        return image.copy()
+    except Exception:
+        return None
+
+
+def load_preview_image(file_path) -> Image.Image | None:
+    path = Path(file_path)
+    extension = path.suffix.lower()
+    if extension in {".jpg", ".jpeg"}:
         try:
-            # Try PreviewImage first
-            cmd = [EXIFTOOL, '-b', '-PreviewImage', file_path]
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if proc.returncode == 0 and len(proc.stdout) > 1000:
-                fd, tmp_path = tempfile.mkstemp(suffix='.jpg', prefix='exifdate_preview_')
-                os.write(fd, proc.stdout)
-                os.close(fd)
-                return tmp_path
-            # Try JpgFromRaw
-            cmd = [EXIFTOOL, '-b', '-JpgFromRaw', file_path]
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if proc.returncode == 0 and len(proc.stdout) > 1000:
-                fd, tmp_path = tempfile.mkstemp(suffix='.jpg', prefix='exifdate_preview_')
-                os.write(fd, proc.stdout)
-                os.close(fd)
-                return tmp_path
-        except Exception as e:
-            print(f"Error extracting preview: {e}")
-    
+            with Image.open(path) as image:
+                image.load()
+                oriented = ImageOps.exif_transpose(image)
+                return oriented.copy()
+        except Exception:
+            return None
+    if extension in {".orf"}:
+        for tag in PREVIEW_TAGS:
+            try:
+                proc = subprocess.run(
+                    [EXIFTOOL, "-b", f"-{tag}", str(path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if proc.returncode != 0 or len(proc.stdout) < 1000:
+                continue
+            image = _open_image(proc.stdout)
+            if image is not None and image.width > 1 and image.height > 1:
+                return image
     return None
